@@ -11,7 +11,7 @@ import sys
 import time
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 
 # ---------------------------------------------------------------- ferramentas pontilhistas (do jardim.py)
@@ -85,11 +85,13 @@ TIME_SCALE = 1.0
 TICK_MS = 10
 WIN_FRAC = 0.92
 LOOP = False
+EDGE_INNER = 7.0      # sensibilidade dos traços internos (menor = mais linhas)
+ESTILO = "linhas"    # "linhas" = só contornos | "esboco" = esboço preenchido | "pontos" = pontilhismo colorido
 T_END = 24.0          # depois disso ela continua "respirando" (só o cabelo e as estrelas se mexem)
 DENS = 70000.0        # pontos por unidade² (a figura tem 1 unidade de altura)
 
 # ---------------------------------------------------------------- paletas
-SKIN_PAL = [(252, 230, 210), (242, 212, 190), (226, 188, 166)]
+SKIN_PAL = [(196, 140, 100), (168, 114, 80), (134, 88, 62)]
 HAIR_PAL = [(108, 96, 146), (68, 57, 104), (42, 33, 72), (20, 16, 42)]
 HAIR_HI = [(190, 180, 225), (225, 215, 250)]
 EYE_PAL = [(14, 8, 8), (40, 22, 16), (78, 48, 30), (122, 82, 52)]
@@ -203,6 +205,16 @@ class Guardian:
         self.build_figure()
         self.build_dynamic()
         self.build_sky()
+        # granulado fixo do "papel" (faz o esboço ter falhas, como grafite)
+        gr = np.random.default_rng(seed + 1)
+        blk = np.kron(gr.random((H // 3 + 1, W // 3 + 1)), np.ones((3, 3)))[:H, :W]
+        self.grain = (0.55 * blk + 0.45 * gr.random((H, W))).astype(np.float32)
+        self.grain2 = gr.random((H, W)).astype(np.float32)
+        self.grain3 = gr.random((H, W)).astype(np.float32)
+        self._sg = None          # contornos das partes fixas (calculados uma vez)
+        self._dynraw = []
+        self._want_lines = False
+        self._bob = 0.0
 
     # ---- util
     def pk(self, pal, g, **k):
@@ -274,13 +286,13 @@ class Guardian:
             parts.append(self.mk(x, y, col, -45))
 
         # rosto
-        x1, y1 = fill_ellipse(rng, 0, 0.852, 0.074, 0.082, dens=190000)
-        x2, y2 = fill_tris(rng, [((-0.05, 0.80), (0.05, 0.80), (0, 0.766))], dens=190000)
+        x1, y1 = fill_ellipse(rng, 0, 0.852, 0.074, 0.082, dens=85000)
+        x2, y2 = fill_tris(rng, [((-0.05, 0.80), (0.05, 0.80), (0, 0.766))], dens=85000)
         add((np.concatenate([x1, x2]), np.concatenate([y1, y2])), SKIN_PAL,
             lambda x, y: 0.10 + 0.30 * rnd(x) + 0.30 * np.clip((0.82 - y) / 0.06, 0, 1) + 0.45 * (np.abs(x) / 0.072) ** 2, -100)
 
         # pescoço, blusa
-        add(fill_tris(rng, quad((-0.017, 0.785), (0.017, 0.785), (0.020, 0.738), (-0.020, 0.738)), dens=190000), SKIN_PAL,
+        add(fill_tris(rng, quad((-0.017, 0.785), (0.017, 0.785), (0.020, 0.738), (-0.020, 0.738)), dens=85000), SKIN_PAL,
             lambda x, y: 0.45 + 0.4 * rnd(x), -350)
         add(fill_tris(rng, quad((-0.075, 0.738), (0.075, 0.738), (0.050, 0.568), (-0.050, 0.568))), BLOUSE_PAL,
             lambda x, y: 0.10 + 0.5 * rnd(x) + 0.3 * (0.74 - y) / 0.17, -400)
@@ -315,7 +327,7 @@ class Guardian:
         # coxas e botas
         for m_ in (-1, 1):
             cx = m_ * 0.045
-            add(fill_tris(rng, quad((cx - 0.027, 0.395), (cx + 0.027, 0.395), (cx + 0.024, 0.300), (cx - 0.024, 0.300))),
+            add(fill_tris(rng, quad((cx - 0.027, 0.395), (cx + 0.027, 0.395), (cx + 0.024, 0.300), (cx - 0.024, 0.300)), dens=62000),
                 SKIN_PAL, lambda x, y: 0.35 + 0.4 * rnd(x), -600)
             yb = weighted(rng, 2600, lambda a: np.ones_like(a)) * 0.265 + 0.035
             hw = 0.021 + 0.007 * (yb - 0.035) / 0.265
@@ -383,6 +395,9 @@ class Guardian:
             col[gl] = self.pk(GLOVE_PAL, 0.1 + 0.5 * rng.random(int(gl.sum())) + 0.2 * np.abs(lat[gl]))
             cu = (s > 0.40) & (s < 0.46)
             col[cu] = self.pk(BOW_PAL, 0.3 + 0.5 * rng.random(int(cu.sum())))
+            keep = gl | cu | (rng.random(n) > 0.35)   # a pele do braço fica mais rala
+            s, lat, col = s[keep], lat[keep], col[keep]
+            n = len(s)
             p = self.mk(np.zeros(n), 0.72 - 0.2 * s, col, -300)
             p.update(s=s, lat=lat, m=m_)
             self.arms.append(p)
@@ -508,13 +523,19 @@ class Guardian:
                           rad=rng.choice([1.0, 1.5, 2.0], n + n2, p=[0.4, 0.4, 0.2]))
 
     # ------------------------------------------------------------ desenho
-    def assemble(self, p, tx, ty, build):
-        """Faz os pontos virem "poeira de estrelas" até a posição final."""
+    def assemble(self, p, tx, ty, build, only_flying=False):
+        """Faz os pontos virem "poeira de estrelas" até a posição final.
+
+        only_flying=True: os pontos que já chegaram somem (no estilo "linhas" a figura
+        é só o traçado, então a poeira não deve "pintar" o interior)."""
         if build >= 0.9999:
+            if only_flying:
+                z = np.zeros(0, np.float32)
+                return z, z, np.zeros((0, 3), np.float32), z, z
             return tx, ty, p['col'], p['rad'], p['z']
         e = np.clip(build * 1.7 - p['d'] * 0.7, 0.0, 1.0)
         e = e * e * (3 - 2 * e)
-        m = e > 0.0
+        m = (e > 0.0) & (e < 0.985) if only_flying else e > 0.0
         em = e[m]
         sx, sy = p['sx'][m], p['sy'][m]
         vx, vy = tx[m] - sx, ty[m] - sy
@@ -529,11 +550,143 @@ class Guardian:
         H, W = self.H, self.W
         sky, build, face, glow = state(t)
         canvas = np.zeros((H, W, 3), np.uint8)
-        B = Batch()
-        self.draw_sky(B, t, sky, glow)
-        self.draw_figure(B, t, build, face, glow)
-        B.draw(canvas)
+        Bsky, Bfig, Bfx = Batch(), Batch(), Batch()
+        self._dynraw = []
+        line_frac = float(smoothstep(build, 0.25, 1.0))
+        self._want_lines = ESTILO == "linhas" and line_frac > 0.0
+        self.draw_sky(Bsky, t, sky, glow)
+        self.draw_figure(Bfig, Bfx, t, build, face, glow)
+        Bsky.draw(canvas)
+        if ESTILO == "pontos":
+            Bfig.draw(canvas)
+        elif ESTILO == "esboco":
+            fig = np.zeros((H, W, 3), np.uint8)
+            Bfig.draw(fig)
+            self.sketch(canvas, fig)
+        else:
+            Bfig.draw(canvas)                           # só a poeira ainda em voo (sem preenchimento)
+            if line_frac > 0.0:
+                self.draw_lines(canvas, line_frac)      # os contornos vão aparecendo onde a poeira chega
+        Bfx.draw(canvas)
         return canvas
+
+    # ---------------- estilo "linhas": a figura é formada só pelas bordas das suas partes
+    def wash(self, canvas, fig, frac):
+        mask = fig.any(axis=2)
+        if not mask.any():
+            return
+        paper = np.array([236, 230, 246], np.float32)
+        soft = fig.astype(np.float32) * 0.55 + paper * 0.45
+        keep = mask & (self.grain > 0.10) & (self.grain3 < frac)
+        canvas[keep] = np.clip(soft[keep], 0, 255).astype(np.uint8)
+
+    def make_group(self, X, Y, rad):
+        """Contorno de uma parte: devolve (índices da região, índices do traço) ou None."""
+        H, W = self.H, self.W
+        if len(X) < 4:
+            return None
+        x0, x1 = max(int(X.min()) - 12, 0), min(int(X.max()) + 13, W)
+        y0, y1 = max(int(Y.min()) - 12, 0), min(int(Y.max()) + 13, H)
+        h, w = y1 - y0, x1 - x0
+        if h < 8 or w < 8:
+            return None
+        m = np.zeros((h, w), np.uint8)
+        splat(m, X - x0, Y - y0, np.full(len(X), 255, np.uint8), rad)
+
+        def erode(a, r):
+            o = a.copy()
+            for dy, dx in ((r, 0), (-r, 0), (0, r), (0, -r)):
+                o &= np.roll(np.roll(a, dy, 0), dx, 1)
+            return o
+
+        def thick(a):
+            return a | np.roll(a, 1, 0) | np.roll(a, 1, 1) | np.roll(np.roll(a, 1, 0), 1, 1)
+
+        solid = np.asarray(Image.fromarray(m).filter(ImageFilter.GaussianBlur(3.0))) > 97
+        if solid.sum() < 20:
+            solid = thick(m > 0)
+        if erode(solid, 2).sum() < 0.12 * solid.sum():
+            outline = solid.copy()          # parte fina (listra, tiara, haste): o próprio traço é a linha
+        else:
+            outline = solid & ~erode(solid, 1)
+        line = thick(outline)
+        ys, xs = np.nonzero(solid)
+        ly, lx = np.nonzero(line)
+        return ((ys + y0) * W + xs + x0).astype(np.int64), ((ly + y0) * W + lx + x0).astype(np.int64)
+
+    @staticmethod
+    def line_color(mean):
+        return np.clip(np.asarray(mean, np.float32) * 0.7 + 112, 0, 255).astype(np.uint8)
+
+    def build_static_lines(self):
+        H, W = self.H, self.W
+        S, ox, oy0 = H * 0.62, W / 2, H * 0.90
+        st = self.static
+        groups = []
+        for zv in np.unique(st['z']):
+            k = st['z'] == zv
+            g = self.make_group(ox + st['x'][k] * S, oy0 - st['y'][k] * S, st['rad'][k])
+            if g is not None:
+                groups.append((float(zv), g[0], g[1], self.line_color(st['col'][k].mean(axis=0))))
+        self._sg = groups
+
+    def draw_lines(self, canvas, frac):
+        H, W = self.H, self.W
+        if self._sg is None:
+            self.build_static_lines()
+        dy = int(round(-self._bob)) * W      # a flutuação vertical é só um deslocamento
+        groups = [(z, np.clip(si + dy, 0, H * W - 1), np.clip(li + dy, 0, H * W - 1), c)
+                  for z, si, li, c in self._sg]
+        for z, X, Y, rad, c in self._dynraw:
+            g = self.make_group(X, Y, rad)
+            if g is not None:
+                groups.append((z, g[0], g[1], self.line_color(c)))
+        A = np.zeros(H * W, bool)
+        Lc = np.zeros((H * W, 3), np.uint8)
+        for z, si, li, c in sorted(groups, key=lambda g: g[0]):
+            A[si] = False        # o que está na frente apaga as linhas de trás
+            A[li] = True
+            Lc[li] = c
+        A, Lc = A.reshape(H, W), Lc.reshape(H, W, 3)
+        sel = A & (self.grain2 > 0.12) & (self.grain3 < frac)
+        mod = (0.82 + 0.18 * self.grain[sel])[:, None]
+        canvas[sel] = np.clip(Lc[sel] * mod, 0, 255).astype(np.uint8)
+
+    def sketch(self, canvas, fig):
+        """Transforma a figura num esboço: cores lavadas, falhas de grafite e contornos a lápis."""
+        mask = fig.any(axis=2)
+        if not mask.any():
+            return
+        paper = np.array([236, 230, 246], np.float32)
+        soft = fig.astype(np.float32) * 0.55 + paper * 0.45
+        keep = mask & (self.grain > 0.10)
+        canvas[keep] = np.clip(soft[keep], 0, 255).astype(np.uint8)
+
+        # contornos a lápis (finos): silhueta + mudanças de cor importantes por dentro
+        def blur(a, r):
+            return np.asarray(Image.fromarray(a).filter(ImageFilter.GaussianBlur(r)), np.float32)
+
+        def shifts(m, r=1):
+            o = m.copy()
+            for dy, dx in ((r, 0), (-r, 0), (0, r), (0, -r)):
+                o &= np.roll(np.roll(m, dy, 0), dx, 1)
+            return o        # erosão
+
+        solid = blur((mask * 255).astype(np.uint8), 3.0) / 255.0 > 0.38
+        outline = solid & ~shifts(solid, 1)
+        lum = blur(fig, 2.6).mean(axis=2)
+        gy, gx = np.gradient(lum)
+        g = np.hypot(gx, gy)
+        ridge = ((g >= np.roll(g, 1, 0)) & (g >= np.roll(g, -1, 0)) &
+                 (g >= np.roll(g, 1, 1)) & (g >= np.roll(g, -1, 1)))
+        inner = ridge & (g > EDGE_INNER) & shifts(solid, 4)
+        thick = lambda m: m | np.roll(m, 1, 0) | np.roll(m, 1, 1) | np.roll(np.roll(m, 1, 0), 1, 1)
+        out_l = thick(outline) & (self.grain2 > 0.12)       # contorno claro (aparece contra o céu)
+        in_l = thick(inner) & (self.grain2 > 0.20) & ~out_l  # traços internos em grafite (escuros)
+        ink = np.array([250, 245, 255], np.float32)
+        pencil = np.array([84, 72, 118], np.float32)
+        canvas[in_l] = np.clip(pencil * (0.75 + 0.25 * self.grain[in_l])[:, None], 0, 255).astype(np.uint8)
+        canvas[out_l] = np.clip(ink * (0.78 + 0.22 * self.grain[out_l])[:, None], 0, 255).astype(np.uint8)
 
     def draw_sky(self, B, t, sky, glow):
         H, W = self.H, self.W
@@ -598,13 +751,14 @@ class Guardian:
         C = self.cloud
         B.add(C['fx'] * W, C['fy'] * H, C['col'] * sky, C['rad'], np.full(len(C['fx']), -3000.0))
 
-        if glow > 0.02:
+        if glow > 0.02 and ESTILO != "linhas":       # a aura preencheria o interior da figura
             h = self.halo
             rh = h['r'] * S * 1.2
             br = (h['b'] * glow * (0.85 + 0.3 * np.sin(t * 1.3 + h['fl'] * 6.28)))[:, None]
             B.add(ox + np.cos(h['a']) * rh, oy - 0.56 * S + np.sin(h['a']) * rh * 1.1,
                   np.array([150, 70, 240], np.float32)[None, :] * br, one(len(rh)), np.full(len(rh), -3100.0))
 
+        if glow > 0.02:
             fl = self.floor
             pulse = 1 + 0.03 * math.sin(t * 1.5)
             fa, fb = 0.26 * pulse, 0.055 * pulse
@@ -612,7 +766,7 @@ class Guardian:
             B.add(ox + np.cos(fl['a']) * fl['r'] * fa * S, oy + 0.02 * S + np.sin(fl['a']) * fl['r'] * fb * S,
                   np.array([255, 170, 240], np.float32)[None, :] * br, one(len(br)), np.full(len(br), -2000.0))
 
-    def draw_figure(self, B, t, build, face, glow):
+    def draw_figure(self, Bf, B, t, build, face, glow):
         H, W = self.H, self.W
         S = H * 0.62
         ox = W / 2
@@ -621,9 +775,14 @@ class Guardian:
         oy = oy0 - bob   # sobe e desce de leve (ela flutua)
         one = lambda n: np.ones(n, np.float32)
 
-        def put(p, tx, ty):
-            x, y, col, rad, z = self.assemble(p, tx, ty, build)
-            B.add(ox + x * S, oy - y * S, col, rad, z)
+        self._bob = bob
+
+        def put(p, tx, ty, grp=False):
+            x, y, col, rad, z = self.assemble(p, tx, ty, build, only_flying=ESTILO == "linhas")
+            Bf.add(ox + x * S, oy - y * S, col, rad, z)
+            if grp and self._want_lines:
+                self._dynraw.append((float(p['z'].mean()), (ox + tx * S).astype(np.float32),
+                                     (oy - ty * S).astype(np.float32), p['rad'], p['col'].mean(axis=0)))
 
         put(self.static, self.static['x'], self.static['y'])
 
@@ -639,7 +798,7 @@ class Guardian:
             nn = np.hypot(dx, dy) + 1e-6
             w = 0.036 * (1 - 0.82 * s ** 1.3) * (0.9 + 0.1 * np.sin(s * 8 + ph))
             off = lat * w + 0.010 * np.sin(s * 9 - t * 2.2 + ph) * s
-            put(p, x - dy / nn * off, y + dx / nn * off)
+            put(p, x - dy / nn * off, y + dx / nn * off, True)
 
         # saia
         for p in self.skirts:
@@ -648,7 +807,7 @@ class Guardian:
             sway = 0.010 * a ** 1.4 * np.sin(t * 1.5 + p['ph'] + a * 1.5)
             x = b * hw + sway
             y = (0.565 - p['L'] * a + 0.010 * a * np.sin(b * 6.0 + t * 1.8 + p['ph']) - 0.012 * a * (1 - b * b))
-            put(p, x, y)
+            put(p, x, y, True)
 
         # braços e varinha
         hand = None
@@ -665,13 +824,13 @@ class Guardian:
             x, y, dx, dy = bez(P, s)
             nn = np.hypot(dx, dy) + 1e-6
             w = 0.019 - 0.005 * s + 0.007 * smoothstep(s, 0.86, 0.95) * (1 - smoothstep(s, 0.97, 1.0))
-            put(p, x - dy / nn * p['lat'] * w, y + dx / nn * p['lat'] * w)
+            put(p, x - dy / nn * p['lat'] * w, y + dx / nn * p['lat'] * w, True)
 
         tilt = 0.10 + 0.02 * math.sin(t * 1.1)
         d = (math.sin(tilt), math.cos(tilt))
         nv = (math.cos(tilt), -math.sin(tilt))
         W_ = self.wand
-        put(W_, hand[0] + W_['u'] * d[0] + W_['v'] * nv[0], hand[1] + W_['u'] * d[1] + W_['v'] * nv[1])
+        put(W_, hand[0] + W_['u'] * d[0] + W_['v'] * nv[0], hand[1] + W_['u'] * d[1] + W_['v'] * nv[1], True)
 
         # brilhos da varinha
         ocx = hand[0] + (self.wand_u0 + 0.007) * d[0] + 0.025 * nv[0]
