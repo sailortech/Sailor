@@ -891,7 +891,7 @@ class App:
         from PIL import ImageTk
 
         self.root = tk.Tk()
-        self.root.title("Guardiã Estelar")
+        self.root.title("Sailor")
         self.root.configure(bg="black")
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         H = int(min(sh * WIN_FRAC, sw * 0.96))
